@@ -5,7 +5,9 @@ import subprocess
 import time
 import numpy as np
 import imageio
-import pygame
+import cv2
+from pynput import keyboard
+from threading import Lock
 
 # Include the unlabeled state (-1) alongside your normal states.
 DEFAULT_STATES = {
@@ -16,10 +18,56 @@ DEFAULT_STATES = {
 }
 STATE_COLORS = {
     -1: (128, 128, 128),  # gray for unlabeled frames
-    0: (255, 0, 0),       # red
-    1: (255, 255, 0),     # yellow
+    0: (0, 0, 255),       # red (BGR)
+    1: (0, 255, 255),     # yellow
     2: (0, 255, 0)        # green
 }
+
+# Add these constants at the top with other constants
+OVERVIEW_BAR_HEIGHT = 50
+DETAIL_BAR_HEIGHT = 50
+INITIAL_HOLD_DELAY = 0.2  # Time before fast labeling starts (200ms)
+FAST_ADVANCE_DELAY = 0.03  # Delay between frames during fast labeling (~30fps)
+
+def draw_progress_bars(frame, labels, current_frame, nframes, vid_width, fps):
+    # Create overview progress bar
+    overview_bar = np.zeros((OVERVIEW_BAR_HEIGHT, vid_width, 3), dtype=np.uint8)
+
+    # Fill overview bar colors
+    for x in range(vid_width):
+        frame_idx = int((x / vid_width) * nframes)
+        state = labels.get(frame_idx, -1)
+        overview_bar[:, x] = STATE_COLORS[state]
+
+    # Draw current frame indicator
+    indicator_x = int((current_frame / nframes) * vid_width)
+    cv2.line(overview_bar, (indicator_x, 0), (indicator_x, OVERVIEW_BAR_HEIGHT), (255, 255, 255), 2)
+
+    # Create detail progress bar (5 seconds before/after)
+    detail_bar = np.zeros((DETAIL_BAR_HEIGHT, vid_width, 3), dtype=np.uint8)
+    start_frame = max(0, current_frame - int(5 * fps))
+    end_frame = min(nframes, current_frame + int(5 * fps))
+    window_size = end_frame - start_frame
+
+    if window_size > 0:
+        for x in range(vid_width):
+            frame_idx = start_frame + int((x / vid_width) * window_size)
+            state = labels.get(frame_idx, -1)
+            detail_bar[:, x] = STATE_COLORS[state]
+
+        # Draw current frame indicator
+        detail_indicator_x = int(((current_frame - start_frame) / window_size) * vid_width)
+        cv2.line(detail_bar, (detail_indicator_x, 0), (detail_indicator_x, DETAIL_BAR_HEIGHT), (255, 255, 255), 2)
+
+        # Add time labels
+        start_time = start_frame / fps
+        end_time = end_frame / fps
+        cv2.putText(detail_bar, f"{start_time:.1f}s", (10, DETAIL_BAR_HEIGHT-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+        cv2.putText(detail_bar, f"{end_time:.1f}s", (vid_width-50, DETAIL_BAR_HEIGHT-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+
+    return np.vstack((frame, overview_bar, detail_bar))
 
 def generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vid_height):
     """
@@ -36,7 +84,8 @@ def generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vi
         frame_index = int(x / vid_width * nframes)
         # For frames that haven't been labeled, default to -1.
         state = labels.get(frame_index, -1)
-        color = STATE_COLORS.get(state, (128, 128, 128))
+        bgr_color = STATE_COLORS.get(state, (128, 128, 128))
+        color = bgr_color[::-1]
         progress_bar[:, x, :] = color
 
     progress_bar_path = os.path.splitext(video_path)[0] + "_progress_bar.png"
@@ -48,11 +97,14 @@ def generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vi
     filter_complex = (
         f"[0:v]pad=iw:ih+{progress_bar_height}:0:0:color=black[bg]; "
         f"[bg][1:v]overlay=0:{vid_height}[ov]; "
-        f"[ov]drawtext=fontfile=/path/to/font.ttf:text='▏':"
-        f"x=(w - tw) * (t / {duration}):"
-        f"y={vid_height} + ({progress_bar_height} - th) / 2:"
-        f"fontsize={progress_bar_height}:"
-        f"fontcolor=white@0.8"
+        f"[ov]drawtext=text='|':"
+        f"x=(w - tw) * (t / {duration}) - (tw/2):"  # Horizontal centering
+        f"y={vid_height} + ({progress_bar_height}/2) - {progress_bar_height//8}:"  # Vertical centering
+        f"fontsize={int(progress_bar_height * 1.1)}:"  # Convert to integer
+        "fontcolor=white@0.8:"
+        "box=1:boxcolor=black@0.5:"
+        "borderw=2:"
+        "line_spacing=0"
     )
 
     cmd = [
@@ -72,47 +124,46 @@ def generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vi
     subprocess.run(cmd, check=True)
     print(f"Review video generated: {output_review}")
 
-def draw_progress_bars(screen, labels, current_frame, nframes, vid_width, overview_height, detail_height, fps, display_height, font):
-    # Draw the overview progress bar
-    overview_bar = np.zeros((overview_height, vid_width, 3), dtype=np.uint8)
-    for x in range(vid_width):
-        frame_index = int(x / vid_width * nframes)
-        state = labels.get(frame_index, -1)
-        color = STATE_COLORS.get(state, (128, 128, 128))
-        overview_bar[:, x, :] = color
+class KeyStateTracker:
+    def __init__(self):
+        self.lock = Lock()
+        self.states = {
+            # Main controls
+            keyboard.Key.space: False,  # Auto-play
+            keyboard.Key.left: False,   # Previous frame
+            keyboard.Key.right: False,  # Next frame
+            keyboard.Key.esc: False,    # Quit
+            keyboard.KeyCode.from_char('q'): False,
 
-    overview_surface = pygame.surfarray.make_surface(np.transpose(overview_bar, (1, 0, 2)))
-    screen.blit(overview_surface, (0, display_height))
+            # Labeling keys
+            keyboard.KeyCode.from_char('0'): False,
+            keyboard.KeyCode.from_char('1'): False,
+            keyboard.KeyCode.from_char('2'): False,
 
-    # Draw the current frame indicator on the overview bar
-    indicator_x = int(current_frame / nframes * vid_width)
-    pygame.draw.line(screen, (255, 255, 255), (indicator_x, display_height), (indicator_x, display_height + overview_height), 2)
+            # Jump controls
+            keyboard.KeyCode.from_char(','): False,  # -5s
+            keyboard.KeyCode.from_char('.'): False   # +5s
+        }
 
-    # Draw the detail progress bar
-    detail_bar = np.zeros((detail_height, vid_width, 3), dtype=np.uint8)
-    start_frame = max(0, current_frame - int(5 * fps))
-    end_frame = min(nframes, current_frame + int(5 * fps))
-    for x in range(vid_width):
-        frame_index = start_frame + int(x / vid_width * (end_frame - start_frame))
-        if frame_index < nframes:
-            state = labels.get(frame_index, -1)
-            color = STATE_COLORS.get(state, (128, 128, 128))
-            detail_bar[:, x, :] = color
+    def on_press(self, key):
+        with self.lock:
+            if key in self.states:
+                self.states[key] = True
+            elif hasattr(key, 'char'):
+                if key.char in ['0', '1', '2', ',', '.', 'q']:
+                    self.states[keyboard.KeyCode.from_char(key.char)] = True
 
-    detail_surface = pygame.surfarray.make_surface(np.transpose(detail_bar, (1, 0, 2)))
-    screen.blit(detail_surface, (0, display_height + overview_height))
+    def on_release(self, key):
+        with self.lock:
+            if key in self.states:
+                self.states[key] = False
+            elif hasattr(key, 'char'):
+                if key.char in ['0', '1', '2', ',', '.', 'q']:
+                    self.states[keyboard.KeyCode.from_char(key.char)] = False
 
-    # Draw the current frame indicator on the detail bar
-    detail_indicator_x = int((current_frame - start_frame) / (end_frame - start_frame) * vid_width)
-    pygame.draw.line(screen, (255, 255, 255), (detail_indicator_x, display_height + overview_height), (detail_indicator_x, display_height + overview_height + detail_height), 2)
-
-    # Draw the time ticks on the detail bar
-    for i in range(11):
-        tick_x = int(i / 10 * vid_width)
-        tick_time = (start_frame + i / 10 * (end_frame - start_frame)) / fps
-        tick_label = f"{tick_time:.1f}s"
-        tick_surface = font.render(tick_label, True, (255, 255, 255))
-        screen.blit(tick_surface, (tick_x, display_height + overview_height + detail_height))
+    def get_state(self, key):
+        with self.lock:
+            return self.states.get(key, False)
 
 def main():
     if len(sys.argv) < 2:
@@ -120,181 +171,154 @@ def main():
         sys.exit(1)
     video_path = sys.argv[1]
 
-    # Open the video using imageio.
-    reader = imageio.get_reader(video_path, 'ffmpeg')
-    meta = reader.get_meta_data()
-    fps = meta.get('fps', 30)
-    nframes = meta.get('nframes')
-    if nframes is None or nframes == float('inf'):
-        duration = meta.get('duration', 0)
-        nframes = int(duration * fps)
+    # Open video with OpenCV
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("Error opening video file")
+        sys.exit(1)
 
-    print(f"Video loaded: {nframes} frames at {fps} fps")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    vid_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Get video dimensions from the first frame.
-    frame0 = reader.get_data(0)
-    vid_height, vid_width, _ = frame0.shape
+    # Initialize keyboard tracker
+    key_tracker = KeyStateTracker()
+    listener = keyboard.Listener(
+        on_press=key_tracker.on_press,
+        on_release=key_tracker.on_release
+    )
+    listener.start()
 
-    # Initialize pygame and scale the window to fit the display.
-    pygame.init()
-    display_info = pygame.display.Info()
-    max_width = display_info.current_w
-    max_height = display_info.current_h
-
-    scale = min(max_width / vid_width, max_height / vid_height, 0.75)
-    display_width = int(vid_width * scale)
-    display_height = int(vid_height * scale)
-    overview_height = 50
-    detail_height = 50
-    total_height = display_height + overview_height + detail_height
-    screen = pygame.display.set_mode((display_width, total_height))
-    pygame.display.set_caption("Video Labeling Tool")
-    font = pygame.font.SysFont(None, 24)
-
-    # Variables to manage labeling.
-    labels = {}  # frame index -> state (0, 1, or 2); unlabeled frames are left unset.
+    labels = {}
     current_frame = 0
-
-    auto_play = False  # Triggered by holding space.
-    held_state = None         # The number key being held (0, 1, or 2).
-    held_state_start = None   # Time when the key was pressed.
-    held_state_last_advance = None  # Time of the last auto-advance.
-
-    clock = pygame.time.Clock()
-    running = True
+    last_frame_time = time.time()
+    held_number = None
+    hold_start_time = 0
 
     print("Controls:")
-    print("  → / ← : Next / Previous frame")
-    print("  , (<) / . (>) : Jump backward/forward 5 seconds")
-    print("  Space : Hold to auto-play")
-    print("  0, 1, 2 : Tap to label current frame; hold for auto-advance after 0.3 sec")
-    print("  Q or ESC or close window: Quit and export current labels (unlabeled frames get -1)")
+    print("  → / ← : Next/Previous frame")
+    print("  ,/. : Jump 5 seconds")
+    print("  Space: Hold to auto-play")
+    print("  0-2: Label current frame (hold for auto-label)")
+    print("  Q: Quit and export")
 
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-
-            # Process keydown events.
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    running = False
-                elif event.key == pygame.K_RIGHT:
-                    current_frame = min(nframes - 1, current_frame + 1)
-                elif event.key == pygame.K_LEFT:
-                    current_frame = max(0, current_frame - 1)
-                elif event.key in (pygame.K_COMMA, pygame.K_LESS):
-                    jump = int(5 * fps)
-                    current_frame = max(0, current_frame - jump)
-                elif event.key in (pygame.K_PERIOD, pygame.K_GREATER):
-                    jump = int(5 * fps)
-                    current_frame = min(nframes - 1, current_frame + jump)
-                elif event.key == pygame.K_SPACE:
-                    auto_play = True
-                elif event.key in (pygame.K_0, pygame.K_1, pygame.K_2):
-                    key_state = event.key - pygame.K_0
-                    # Start tracking the held number key.
-                    if held_state is None:
-                        held_state = key_state
-                        held_state_start = pygame.time.get_ticks()
-                        held_state_last_advance = None
-                        labels[current_frame] = held_state
-                        print(f"Labeled frame {current_frame} as {held_state} ({DEFAULT_STATES[held_state]})")
-
-            # Process keyup events for the number keys.
-            elif event.type == pygame.KEYUP:
-                if event.key in (pygame.K_0, pygame.K_1, pygame.K_2):
-                    released_state = event.key - pygame.K_0
-                    if held_state is not None and held_state == released_state:
-                        held_state = None
-                        held_state_start = None
-                        held_state_last_advance = None
-
-        keys = pygame.key.get_pressed()
-        if not keys[pygame.K_SPACE]:
-            auto_play = False
-
-        # Held number key auto-advance.
-        if held_state is not None:
-            current_ticks = pygame.time.get_ticks()
-            if held_state_last_advance is None:
-                if current_ticks - held_state_start >= 300:
-                    held_state_last_advance = current_ticks
-                    labels[current_frame] = held_state
-                    print(f"Auto-labeled frame {current_frame} as {held_state} ({DEFAULT_STATES[held_state]}) [triggered after hold delay]")
-                    current_frame += 1
-                    if current_frame >= nframes:
-                        running = False
-                    clock.tick(fps)
-                    continue
-            else:
-                interval = 1000 / fps
-                if current_ticks - held_state_last_advance >= interval:
-                    held_state_last_advance = current_ticks
-                    labels[current_frame] = held_state
-                    print(f"Auto-labeled frame {current_frame} as {held_state} ({DEFAULT_STATES[held_state]})")
-                    current_frame += 1
-                    if current_frame >= nframes:
-                        running = False
-                    clock.tick(fps)
-                    continue
-
-        # Space bar auto-play.
-        if auto_play:
-            current_frame += 1
-            if current_frame >= nframes:
-                running = False
-            clock.tick(fps)
-            continue
-
-        # Display the current frame.
-        try:
-            frame = reader.get_data(current_frame)
-        except IndexError:
-            running = False
+    cv2.namedWindow("Video Labeling Tool", cv2.WINDOW_NORMAL)
+    while True:
+        # Read and display frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
+        ret, frame = cap.read()
+        if not ret:
             break
 
-        # Convert frame (from imageio: height x width x 3) for pygame (width x height x 3)
-        frame_surface = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
-        frame_surface = pygame.transform.scale(frame_surface, (display_width, display_height))
-        screen.blit(frame_surface, (0, 0))
+        # Update display
+        display = frame.copy()
+        text = f"Frame: {current_frame}/{nframes-1}"
+        state = labels.get(current_frame, -1)
+        text += f" | State: {state} ({DEFAULT_STATES[state]})"
+        color = STATE_COLORS.get(state, (255, 255, 255))
+        cv2.putText(display, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # Display frame information.
-        text_str = f"Frame: {current_frame}"
-        if current_frame in labels:
-            state = labels[current_frame]
-            text_str += f" | Label: {state} ({DEFAULT_STATES[state]})"
-        else:
-            text_str += " | Unlabeled"
-        text_surface = font.render(text_str, True, (255, 255, 255))
-        screen.blit(text_surface, (10, 10))
+        # Add progress bars to frame
+        combined_frame = draw_progress_bars(display, labels, current_frame, nframes, vid_width, fps)
+        cv2.imshow("Video Labeling Tool", combined_frame)
 
-        draw_progress_bars(screen, labels, current_frame, nframes, display_width, overview_height, detail_height, fps, display_height, font)
+        # Calculate timing
+        now = time.time()
+        elapsed = now - last_frame_time
+        frame_delay = 1 / fps
 
-        pygame.display.flip()
+        # Control flags
+        should_advance = False
+        fast_advance = False
+        held_this_frame = False
 
-        clock.tick(30)
+        # Handle controls
+        if key_tracker.get_state(keyboard.Key.esc) or key_tracker.get_state(keyboard.KeyCode.from_char('q')):
+            break
 
-    pygame.quit()
+        # Spacebar handling (normal speed)
+        if key_tracker.get_state(keyboard.Key.space):
+            should_advance = True
 
-    # For frames that weren't labeled, assign -1.
-    for i in range(int(nframes)):
+        # Number key handling (fast labeling)
+        for num, key in enumerate([keyboard.KeyCode.from_char(str(n)) for n in range(3)]):
+            if key_tracker.get_state(key):
+                held_this_frame = True
+                labels[current_frame] = num  # Label current frame
+
+                if held_number != num:
+                    # New key press - immediate advance
+                    held_number = num
+                    hold_start = now
+                    current_frame = min(current_frame + 1, nframes - 1)
+                    last_frame_time = now
+                else:
+                    # Continuing hold - check for fast advance
+                    if now - hold_start > INITIAL_HOLD_DELAY:
+                        fast_advance = True
+                break
+
+        # Reset states if no keys are pressed
+        if not held_this_frame:
+            held_number = None
+            fast_advance = False
+
+        # Handle frame advancement
+        if fast_advance:
+            # Ultra-fast labeling mode
+            if (now - last_frame_time) >= FAST_ADVANCE_DELAY:
+                current_frame = min(current_frame + 1, nframes - 1)
+                labels[current_frame] = held_number  # Label while advancing
+                last_frame_time = now
+        elif should_advance:
+            # Normal playback speed
+            if elapsed >= frame_delay:
+                current_frame = min(current_frame + 1, nframes - 1)
+                last_frame_time = now
+
+        # Handle other controls
+        if key_tracker.get_state(keyboard.Key.right):
+            current_frame = min(current_frame + 1, nframes - 1)
+        if key_tracker.get_state(keyboard.Key.left):
+            current_frame = max(0, current_frame - 1)
+        if key_tracker.get_state(keyboard.KeyCode.from_char(',')):
+            current_frame = max(0, current_frame - int(5 * fps))
+        if key_tracker.get_state(keyboard.KeyCode.from_char('.')):
+            current_frame = min(nframes - 1, current_frame + int(5 * fps))
+
+        # Handle OpenCV events
+        key = cv2.waitKey(1 if (fast_advance or should_advance) else 0)
+        if key == ord('q'):
+            break
+    # Cleanup and export (same as original)
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # Fill unlabeled frames and export CSV
+    not_labelled = 0
+    not_labelled_frames = []
+    for i in range(nframes):
         if i not in labels:
+            not_labelled += 1
+            not_labelled_frames.append(i)
             labels[i] = -1
-            print(f"Frame {i} left unlabeled (assigned -1).")
 
-    # Export the results to CSV.
+    if not_labelled != 0:
+        print(f"{not_labelled} frame(s) detected as not labelled.")
+        print(not_labelled_frames)
+
     csv_filename = os.path.splitext(video_path)[0] + "_labels.csv"
-    with open(csv_filename, mode="w", newline="") as csv_file:
-        writer = csv.writer(csv_file)
+    with open(csv_filename, "w", newline="") as f:
+        writer = csv.writer(f)
         writer.writerow(["frame", "state", "state_label"])
         for i in range(nframes):
-            state = labels.get(i, -1)
+            state = labels[i]
             writer.writerow([i, state, DEFAULT_STATES.get(state, "unlabeled")])
     print(f"Labels exported to {csv_filename}")
 
-    # Generate the review video with the progress bar.
-    print("Generating review video with progress bar overlay using ffmpeg...")
+    # Generate review video
+    print("Generating review video...")
     generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vid_height)
 
 if __name__ == "__main__":
