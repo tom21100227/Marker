@@ -8,42 +8,89 @@ import imageio
 import cv2
 from pynput import keyboard
 from threading import Lock
+from collections import deque
 
-# Include the unlabeled state (-1) alongside your normal states.
+class FrameBuffer:
+    def __init__(self, video_path, buffer_size=200):
+        self.cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+        self.buffer_size = buffer_size
+        self.frame_buffer = deque(maxlen=buffer_size)
+        self.buffer_start_frame = 0
+        self.seek_count = 0
+        self._fill_buffer()
+
+    def _fill_buffer(self):
+        while len(self.frame_buffer) < self.buffer_size:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            self.frame_buffer.append(frame)
+
+    def get_frame(self, target_frame):
+        if target_frame < 0 or target_frame >= int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)):
+            return None
+
+        # Handle sequential forward access
+        if target_frame == self.buffer_start_frame + len(self.frame_buffer):
+            ret, frame = self.cap.read()
+            if ret:
+                self.frame_buffer.append(frame)
+                self.buffer_start_frame += 1
+                return frame
+
+        # Check if frame is in buffer
+        buffer_end = self.buffer_start_frame + len(self.frame_buffer) - 1
+        if self.buffer_start_frame <= target_frame <= buffer_end:
+            offset = target_frame - self.buffer_start_frame
+            return self.frame_buffer[offset]
+
+        # Need to seek
+        self.seek_count += 1
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        self.frame_buffer.clear()
+        self._fill_buffer()
+        self.buffer_start_frame = target_frame
+        return self.frame_buffer[0] if self.frame_buffer else None
+
+    def release(self):
+        self.cap.release()
+
 DEFAULT_STATES = {
     -1: "unlabeled",
     0: "not flying",
     1: "transition",
     2: "flying"
 }
+
 STATE_COLORS = {
-    -1: (128, 128, 128),  # gray for unlabeled frames
-    0: (0, 0, 255),       # red (BGR)
-    1: (0, 255, 255),     # yellow
-    2: (0, 255, 0)        # green
+    -1: (128, 128, 128),
+    0: (0, 0, 255),
+    1: (0, 255, 255),
+    2: (0, 255, 0)
 }
 
-# Add these constants at the top with other constants
+USE_HARDWARE_ACCEL = True
+if USE_HARDWARE_ACCEL:
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hwaccel;videotoolbox"
+
 OVERVIEW_BAR_HEIGHT = 50
 DETAIL_BAR_HEIGHT = 50
-INITIAL_HOLD_DELAY = 0.2  # Time before fast labeling starts (200ms)
-FAST_ADVANCE_DELAY = 0.03  # Delay between frames during fast labeling (~30fps)
+INITIAL_HOLD_DELAY = 0.3
+FAST_ADVANCE_DELAY = 0.03
+DISPLAY_EVERY = 2  # Show every 2nd frame during fast advance
 
 def draw_progress_bars(frame, labels, current_frame, nframes, vid_width, fps):
-    # Create overview progress bar
     overview_bar = np.zeros((OVERVIEW_BAR_HEIGHT, vid_width, 3), dtype=np.uint8)
 
-    # Fill overview bar colors
     for x in range(vid_width):
         frame_idx = int((x / vid_width) * nframes)
         state = labels.get(frame_idx, -1)
         overview_bar[:, x] = STATE_COLORS[state]
 
-    # Draw current frame indicator
     indicator_x = int((current_frame / nframes) * vid_width)
     cv2.line(overview_bar, (indicator_x, 0), (indicator_x, OVERVIEW_BAR_HEIGHT), (255, 255, 255), 2)
 
-    # Create detail progress bar (5 seconds before/after)
     detail_bar = np.zeros((DETAIL_BAR_HEIGHT, vid_width, 3), dtype=np.uint8)
     start_frame = max(0, current_frame - int(5 * fps))
     end_frame = min(nframes, current_frame + int(5 * fps))
@@ -55,11 +102,9 @@ def draw_progress_bars(frame, labels, current_frame, nframes, vid_width, fps):
             state = labels.get(frame_idx, -1)
             detail_bar[:, x] = STATE_COLORS[state]
 
-        # Draw current frame indicator
         detail_indicator_x = int(((current_frame - start_frame) / window_size) * vid_width)
         cv2.line(detail_bar, (detail_indicator_x, 0), (detail_indicator_x, DETAIL_BAR_HEIGHT), (255, 255, 255), 2)
 
-        # Add time labels
         start_time = start_frame / fps
         end_time = end_frame / fps
         cv2.putText(detail_bar, f"{start_time:.1f}s", (10, DETAIL_BAR_HEIGHT-10),
@@ -70,19 +115,12 @@ def draw_progress_bars(frame, labels, current_frame, nframes, vid_width, fps):
     return np.vstack((frame, overview_bar, detail_bar))
 
 def generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vid_height):
-    """
-    Generate a review video using ffmpeg.
-    A progress bar (with a dynamic white cursor) is added below the video.
-    Unlabeled frames (state -1) are shown in gray.
-    """
-    progress_bar_height = 50  # Height of the progress bar in pixels
-    duration = nframes / fps  # Total duration of the video in seconds
+    progress_bar_height = 50
+    duration = nframes / fps
 
-    # Generate the static progress bar image.
     progress_bar = np.zeros((progress_bar_height, vid_width, 3), dtype=np.uint8)
     for x in range(vid_width):
         frame_index = int(x / vid_width * nframes)
-        # For frames that haven't been labeled, default to -1.
         state = labels.get(frame_index, -1)
         bgr_color = STATE_COLORS.get(state, (128, 128, 128))
         color = bgr_color[::-1]
@@ -98,9 +136,9 @@ def generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vi
         f"[0:v]pad=iw:ih+{progress_bar_height}:0:0:color=black[bg]; "
         f"[bg][1:v]overlay=0:{vid_height}[ov]; "
         f"[ov]drawtext=text='|':"
-        f"x=(w - tw) * (t / {duration}) - (tw/2):"  # Horizontal centering
-        f"y={vid_height} + ({progress_bar_height}/2) - {progress_bar_height//8}:"  # Vertical centering
-        f"fontsize={int(progress_bar_height * 1.1)}:"  # Convert to integer
+        f"x=(w - tw) * (t / {duration}) - (tw/2):"
+        f"y={vid_height} + ({progress_bar_height}/2) - {progress_bar_height//8}:"
+        f"fontsize={int(progress_bar_height * 1.1)}:"
         "fontcolor=white@0.8:"
         "box=1:boxcolor=black@0.5:"
         "borderw=2:"
@@ -109,13 +147,13 @@ def generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vi
 
     cmd = [
         "ffmpeg",
-        "-y",  # Overwrite output file if it exists.
-        "-hwaccel", "auto",  # Use GPU acceleration when possible.
+        "-y",
+        "-hwaccel", "auto",
         "-i", video_path,
         "-i", progress_bar_path,
         "-filter_complex", filter_complex,
-        "-c:v", "h264_videotoolbox", # macOS specific,
-        "-b:v", "5000k",  # Bitrate for the video stream.
+        "-c:v", "h264_videotoolbox",
+        "-b:v", "5000k",
         "-c:a", "copy",
         output_review
     ]
@@ -128,21 +166,16 @@ class KeyStateTracker:
     def __init__(self):
         self.lock = Lock()
         self.states = {
-            # Main controls
-            keyboard.Key.space: False,  # Auto-play
-            keyboard.Key.left: False,   # Previous frame
-            keyboard.Key.right: False,  # Next frame
-            keyboard.Key.esc: False,    # Quit
+            keyboard.Key.space: False,
+            keyboard.Key.left: False,
+            keyboard.Key.right: False,
+            keyboard.Key.esc: False,
             keyboard.KeyCode.from_char('q'): False,
-
-            # Labeling keys
             keyboard.KeyCode.from_char('0'): False,
             keyboard.KeyCode.from_char('1'): False,
             keyboard.KeyCode.from_char('2'): False,
-
-            # Jump controls
-            keyboard.KeyCode.from_char(','): False,  # -5s
-            keyboard.KeyCode.from_char('.'): False   # +5s
+            keyboard.KeyCode.from_char(','): False,
+            keyboard.KeyCode.from_char('.'): False
         }
 
     def on_press(self, key):
@@ -171,18 +204,16 @@ def main():
         sys.exit(1)
     video_path = sys.argv[1]
 
-    # Open video with OpenCV
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("Error opening video file")
-        sys.exit(1)
+    frame_buffer = FrameBuffer(video_path)
+    cap = frame_buffer.cap
+
+    print(f"Hardware acceleration status: {'Active' if cap.get(cv2.CAP_PROP_HW_ACCELERATION) > 0 else 'Inactive'}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     vid_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     vid_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Initialize keyboard tracker
     key_tracker = KeyStateTracker()
     listener = keyboard.Listener(
         on_press=key_tracker.on_press,
@@ -195,6 +226,7 @@ def main():
     last_frame_time = time.time()
     held_number = None
     hold_start_time = 0
+    display_counter = 0
 
     print("Controls:")
     print("  → / ← : Next/Previous frame")
@@ -204,36 +236,19 @@ def main():
     print("  Q: Quit and export")
 
     cv2.namedWindow("Video Labeling Tool", cv2.WINDOW_NORMAL)
+
     while True:
-        # Read and display frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Update display
-        display = frame.copy()
-        text = f"Frame: {current_frame}/{nframes-1}"
-        state = labels.get(current_frame, -1)
-        text += f" | State: {state} ({DEFAULT_STATES[state]})"
-        color = STATE_COLORS.get(state, (255, 255, 255))
-        cv2.putText(display, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        # Add progress bars to frame
-        combined_frame = draw_progress_bars(display, labels, current_frame, nframes, vid_width, fps)
-        cv2.imshow("Video Labeling Tool", combined_frame)
-
-        # Calculate timing
+        # --- INPUT HANDLING FIRST ---
         now = time.time()
         elapsed = now - last_frame_time
         frame_delay = 1 / fps
 
-        # Control flags
+        # Reset control flags
         should_advance = False
         fast_advance = False
         held_this_frame = False
 
-        # Handle controls
+        # Handle quit commands
         if key_tracker.get_state(keyboard.Key.esc) or key_tracker.get_state(keyboard.KeyCode.from_char('q')):
             break
 
@@ -251,7 +266,7 @@ def main():
                     # New key press - immediate advance
                     held_number = num
                     hold_start = now
-                    current_frame = min(current_frame + 1, nframes - 1)
+                    # current_frame = min(current_frame + 1, nframes - 1)
                     last_frame_time = now
                 else:
                     # Continuing hold - check for fast advance
@@ -264,12 +279,12 @@ def main():
             held_number = None
             fast_advance = False
 
-        # Handle frame advancement
+        # Frame advancement logic
         if fast_advance:
             # Ultra-fast labeling mode
             if (now - last_frame_time) >= FAST_ADVANCE_DELAY:
                 current_frame = min(current_frame + 1, nframes - 1)
-                labels[current_frame] = held_number  # Label while advancing
+                labels[current_frame] = held_number
                 last_frame_time = now
         elif should_advance:
             # Normal playback speed
@@ -277,25 +292,59 @@ def main():
                 current_frame = min(current_frame + 1, nframes - 1)
                 last_frame_time = now
 
-        # Handle other controls
+        # --- ARROW KEY HANDLING ---
+        # print(f"\nCurrent key states:")
+        # print(f"Left: {key_tracker.get_state(keyboard.Key.left)} | Right: {key_tracker.get_state(keyboard.Key.right)}")
+        # print(f"Current frame before controls: {current_frame}")
+
+        # Handle arrow key navigation
         if key_tracker.get_state(keyboard.Key.right):
+            print("Processing RIGHT key press")
             current_frame = min(current_frame + 1, nframes - 1)
         if key_tracker.get_state(keyboard.Key.left):
+            print("Processing LEFT key press")
             current_frame = max(0, current_frame - 1)
+
+        # Handle jump controls
         if key_tracker.get_state(keyboard.KeyCode.from_char(',')):
+            print("Processing COMMA key press")
             current_frame = max(0, current_frame - int(5 * fps))
         if key_tracker.get_state(keyboard.KeyCode.from_char('.')):
+            print("Processing PERIOD key press")
             current_frame = min(nframes - 1, current_frame + int(5 * fps))
 
-        # Handle OpenCV events
+        # print(f"Current frame after controls: {current_frame}")
+
+        # --- FRAME PROCESSING ---
+        # Get frame AFTER handling inputs
+        frame = frame_buffer.get_frame(current_frame)
+        if frame is None:
+            break
+
+        # --- DISPLAY UPDATE ---
+        # Only update display when needed
+        if not (display_counter % DISPLAY_EVERY == 0 and held_number is not None):
+            display = frame.copy()
+            text = f"Frame: {current_frame}/{nframes-1}"
+            state = labels.get(current_frame, -1)
+            text += f" | State: {state} ({DEFAULT_STATES[state]})"
+            color = STATE_COLORS.get(state, (255, 255, 255))
+            cv2.putText(display, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            combined_frame = draw_progress_bars(display, labels, current_frame, nframes, vid_width, fps)
+            cv2.imshow("Video Labeling Tool", combined_frame)
+
+        display_counter += 1
+
+        # --- FINAL EVENT PROCESSING ---
+        # Handle OpenCV events last
         key = cv2.waitKey(1 if (fast_advance or should_advance) else 0)
+        # print(f"waitKey returned: {key}")
         if key == ord('q'):
             break
-    # Cleanup and export (same as original)
-    cap.release()
+
+    frame_buffer.release()
     cv2.destroyAllWindows()
 
-    # Fill unlabeled frames and export CSV
     not_labelled = 0
     not_labelled_frames = []
     for i in range(nframes):
@@ -317,9 +366,9 @@ def main():
             writer.writerow([i, state, DEFAULT_STATES.get(state, "unlabeled")])
     print(f"Labels exported to {csv_filename}")
 
-    # Generate review video
     print("Generating review video...")
     generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vid_height)
+    print(f"Buffer efficiency: {nframes - frame_buffer.seek_count}/{nframes} frames served from cache")
 
 if __name__ == "__main__":
     main()
