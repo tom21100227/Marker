@@ -1,4 +1,5 @@
 numpy
+pandas
 imageio
 opencv-python
 pynput

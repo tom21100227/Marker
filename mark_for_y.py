@@ -370,5 +370,24 @@ def main():
     generate_review_video_ffmpeg(video_path, labels, fps, nframes, vid_width, vid_height)
     print(f"Buffer efficiency: {nframes - frame_buffer.seek_count}/{nframes} frames served from cache")
 
+    print("Now do some statistics on the labels and generate a report!")
+    # The number of frames in positive, negative, and transition states
+    # and the percentage
+    positive = 0
+    negative = 0
+    transition = 0
+    for i in labels:
+        if labels[i] == 0:
+            negative += 1
+        elif labels[i] == 1:
+            transition += 1
+        elif labels[i] == 2:
+            positive += 1
+
+    print(f"Positive: {positive} frames, {positive/nframes*100:.2f}%")
+    print(f"Negative: {negative} frames, {negative/nframes*100:.2f}%")
+    print(f"Transition: {transition} frames, {transition/nframes*100:.2f}%")
+
+
 if __name__ == "__main__":
     main()
